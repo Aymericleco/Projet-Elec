@@ -1,0 +1,400 @@
+#include <SPI.h>
+#include <Wire.h>
+#include <LedControl.h>
+#include <RTClib.h>
+#include <EEPROM.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <Arduino.h>
+
+#define TRIG_PIN 2  // Pin pour le signal Trigger
+#define ECHO_PIN 3  // Pin pour le signal Echo
+unsigned long snoozeDuration = 300; // Durée du snooze en secondes
+bool alarmActive = false; // État de l'alarme
+// Définir la taille et les broches de l'écran OLED
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET -1
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+// Paramètres des matrices LED
+#define NUM_MATRICES 4
+#define DIN_PIN 12
+#define CLK_PIN 11
+#define CS_PIN 10
+
+// Boutons
+#define BTN_UP 0
+#define BTN_DOWN 1
+#define BTN_SELECT 2
+#define STOP_ALARM_BUTTON 3
+// Buzzer pour réveil
+#define BUZZER_PIN 6
+
+// Création de l'objet LedControl
+LedControl lc = LedControl(DIN_PIN, CLK_PIN, CS_PIN, NUM_MATRICES);
+
+// Création de l'objet RTC
+RTC_DS1307 rtc;
+
+// Tableaux des chiffres en binaire
+const byte chiffresBinaire[10][8] = {
+  {0b00111100, 0b01000010, 0b01000010, 0b01000010, 0b01000010, 0b01000010, 0b01000010, 0b00111100}, // 0
+  {0b00001000, 0b00011000, 0b00101000, 0b00001000, 0b00001000, 0b00001000, 0b00001000, 0b00111110}, // 1
+  {0b00111100, 0b01000010, 0b00000010, 0b00001100, 0b00110000, 0b01000000, 0b01000010, 0b00111110}, // 2
+  {0b00111100, 0b01000010, 0b00000010, 0b00011100, 0b00000010, 0b00000010, 0b01000010, 0b00111100}, // 3
+  {0b00000100, 0b00001100, 0b00010100, 0b00100100, 0b01000100, 0b01111110, 0b00000100, 0b00000100}, // 4
+  {0b01111110, 0b01000000, 0b01000000, 0b01111100, 0b00000010, 0b00000010, 0b01000010, 0b00111100}, // 5
+  {0b00111100, 0b01000010, 0b01000000, 0b01111100, 0b01000010, 0b01000010, 0b01000010, 0b00111100}, // 6
+  {0b01111110, 0b00000010, 0b00000100, 0b00001000, 0b00010000, 0b00100000, 0b01000000, 0b01000000}, // 7
+  {0b00111100, 0b01000010, 0b01000010, 0b00111100, 0b01000010, 0b01000010, 0b01000010, 0b00111100}, // 8
+  {0b00111100, 0b01000010, 0b01000010, 0b01000010, 0b00111110, 0b00000010, 0b01000010, 0b00111100}  // 9
+};
+
+// Variables globales
+int alarmHour = 7, alarmMinute = 0; // Heure d'alarme
+bool alarmEnabled = false;
+bool format24h = true; // Format 24h activé par défaut
+int snoozeTime = 5; // Durée du snooze par défaut
+int menuState = 0; // État du menu (0 = affichage, 1 = réglage heure, 2 = réglage alarme)
+unsigned long lastButtonPress = 0; // Anti-rebond
+// Mélodie stockée dans l'EEPROM
+const int melodyAddress = 0; // Adresse de base dans l'EEPROM
+
+// Fréquences des notes de la mélodie (exemple : DO, RE, MI, ...)
+const int melody[] = {
+  523, 523, 523, 523, 523, 523, 493, 523, 440, 349, 392, 440, 523, 523, 523, 523, 523, 523, 493, 523, 440, 349, 392
+}; 
+
+const int noteDurations[] = {
+  400, 400, 400, 400, 400, 400, 400, 400, 400, 400, 400, 400, 400, 400, 400, 400, 400, 400, 400, 400, 400, 400, 400
+}; // Durée de chaque note en ms
+void saveMelodyToEEPROM() {
+  for (int i = 0; i < 7; i++) {
+    EEPROM.put(melodyAddress + i * sizeof(int), melody[i]);
+  }
+}
+
+void setup() {
+pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
+Serial.begin(9600);
+// Initialisation de l'écran OLED
+  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    Serial.println(F("SSD1306 allocation failed"));
+    for (;;);  // Boucle infinie si l'initialisation échoue
+  }
+  display.clearDisplay();
+  display.display();
+  pinMode(STOP_ALARM_BUTTON, INPUT_PULLUP);
+  // Affichage d'un message de démarrage
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0, 0);
+  display.println("Reveil initialise");
+  display.display();
+  delay(2000);
+  // Initialisation des matrices LED
+  for (int i = 0; i < NUM_MATRICES; i++) {
+    lc.shutdown(i, false);      // Active la matrice
+    lc.setIntensity(i, 10);     // Luminosité moyenne
+    lc.clearDisplay(i);         // Efface l'affichage
+  }
+
+  // Initialisation RTC
+  if (!rtc.begin()) {
+    while (1); // Boucle si problème de communication
+  }
+
+  pinMode(BTN_UP, INPUT_PULLUP);
+  pinMode(BTN_DOWN, INPUT_PULLUP);
+  pinMode(BTN_SELECT, INPUT_PULLUP);
+  pinMode(BUZZER_PIN, OUTPUT);
+// Sauvegarde de la mélodie dans l'EEPROM
+  saveMelodyToEEPROM();
+}
+
+long getDistance() {
+  digitalWrite(TRIG_PIN, LOW);
+  delayMicroseconds(2);
+  digitalWrite(TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(TRIG_PIN, LOW);
+
+  long duration = pulseIn(ECHO_PIN, HIGH); // Temps pour un aller-retour
+  long distance = (duration * 0.034) / 2;  // Convertir en cm
+  return distance;
+}
+
+void afficherMenuOLED() {
+  display.clearDisplay();
+
+  // Afficher l'heure actuelle
+  DateTime now = rtc.now();
+  display.setTextSize(2);
+  display.setCursor(0, 0);
+char buffer[6]; // Tampon pour stocker l'heure formatée
+sprintf(buffer, "%02d:%02d", now.hour(), now.minute());
+display.println(buffer); // Affiche l'heure formatée
+
+  // Afficher l'état de l'alarme
+  display.setTextSize(1);
+  display.setCursor(0, 20);
+  if (alarmEnabled) {
+    display.println("Alarme: ACTIVE");
+  } else {
+    display.println("Alarme: INACTIVE");
+  }
+
+  // Afficher le menu en cours
+  display.setCursor(0, 40);
+  if (menuState == 0) {
+    display.println("Menu: Heure");
+  } else if (menuState == 1) {
+    display.println("Menu: Reglage Heure");
+  } else if (menuState == 2) {
+    display.println("Menu: Reglage Alarme");
+  }
+
+  display.display();
+}
+void playMelody() {
+  unsigned long startTime = millis();
+  const int melodyLength = sizeof(melody) / sizeof(melody[0]);
+
+  for (int i = 0; i < melodyLength; i++) {
+    int note;
+    EEPROM.get(melodyAddress + i * sizeof(int), note);
+
+    tone(BUZZER_PIN, note, noteDurations[i]);
+    delay(noteDurations[i]);
+
+    // Stop conditions
+    if (millis() - startTime > 10000 || 
+        digitalRead(BTN_SELECT) == LOW || 
+        !alarmActive) {
+      noTone(BUZZER_PIN);
+      break;
+    }
+  }
+}
+
+void afficheChiffre(int matrice, int chiffre) {
+  for (int row = 0; row < 8; row++) {
+    lc.setRow(matrice, row, chiffresBinaire[chiffre][row]);
+  }
+}
+
+void afficheHeures() {
+  DateTime now = rtc.now();
+
+  int heures = now.hour();
+  int minutes = now.minute();
+
+  // Conversion format 12h
+  if (!format24h) {
+    heures = heures % 12;
+    if (heures == 0) heures = 12;
+  }
+
+  // Séparation des dizaines et unités
+  int h1 = heures / 10;
+  int h2 = heures % 10;
+  int m1 = minutes / 10;
+  int m2 = minutes % 10;
+
+  // Affichage des chiffres sur les matrices
+  afficheChiffre(0, h1);  // Dizaines d'heures
+  afficheChiffre(1, h2);  // Unités d'heures
+  afficheChiffre(2, m1);  // Dizaines de minutes
+  afficheChiffre(3, m2);  // Unités de minutes
+}
+
+void afficheSeparateur() {
+  lc.setLed(1, 2, 7, true);
+  lc.setLed(1, 5, 7, true);
+}
+void reglageHeure() {
+  DateTime now = rtc.now();
+  int heures = now.hour();
+  int minutes = now.minute();
+
+  while (true) {
+    if (digitalRead(BTN_UP) == LOW && millis() - lastButtonPress > 200) {
+      lastButtonPress = millis();
+      heures = (heures + 1) % 24; // Incrémenter l'heure
+    }
+
+    if (digitalRead(BTN_DOWN) == LOW && millis() - lastButtonPress > 200) {
+      lastButtonPress = millis();
+      heures = (heures - 1 + 24) % 24; // Décrémenter l'heure
+    }
+
+    if (digitalRead(BTN_SELECT) == LOW && millis() - lastButtonPress > 200) {
+      lastButtonPress = millis();
+      // Confirmer l'heure, passer au réglage des minutes
+      break;
+    }
+
+    // Afficher l'heure en cours de réglage
+    afficheChiffre(0, heures / 10); // Dizaines d'heures
+    afficheChiffre(1, heures % 10); // Unités d'heures
+  }
+
+  while (true) {
+    if (digitalRead(BTN_UP) == LOW && millis() - lastButtonPress > 200) {
+      lastButtonPress = millis();
+      minutes = (minutes + 1) % 60; // Incrémenter les minutes
+    }
+
+    if (digitalRead(BTN_DOWN) == LOW && millis() - lastButtonPress > 200) {
+      lastButtonPress = millis();
+      minutes = (minutes - 1 + 60) % 60; // Décrémenter les minutes
+    }
+
+    if (digitalRead(BTN_SELECT) == LOW && millis() - lastButtonPress > 200) {
+      lastButtonPress = millis();
+      // Confirmer les minutes et quitter
+      break;
+    }
+
+    // Afficher les minutes en cours de réglage
+    afficheChiffre(2, minutes / 10); // Dizaines de minutes
+    afficheChiffre(3, minutes % 10); // Unités de minutes
+  }
+
+  // Enregistrer l'heure dans le RTC
+  rtc.adjust(DateTime(now.year(), now.month(), now.day(), heures, minutes, now.second()));
+}
+
+void reglageAlarme() {
+  while (true) {
+    if (digitalRead(BTN_UP) == LOW && millis() - lastButtonPress > 200) {
+      lastButtonPress = millis();
+      alarmHour = (alarmHour + 1) % 24; // Incrémenter l'heure de l'alarme
+    }
+
+    if (digitalRead(BTN_DOWN) == LOW && millis() - lastButtonPress > 200) {
+      lastButtonPress = millis();
+      alarmHour = (alarmHour - 1 + 24) % 24; // Décrémenter l'heure de l'alarme
+    }
+
+    if (digitalRead(BTN_SELECT) == LOW && millis() - lastButtonPress > 200) {
+      lastButtonPress = millis();
+      // Confirmer l'heure, passer au réglage des minutes
+      break;
+    }
+
+    // Afficher l'heure de l'alarme en cours de réglage
+    afficheChiffre(0, alarmHour / 10); // Dizaines d'heures
+    afficheChiffre(1, alarmHour % 10); // Unités d'heures
+  }
+
+  while (true) {
+    if (digitalRead(BTN_UP) == LOW && millis() - lastButtonPress > 200) {
+      lastButtonPress = millis();
+      alarmMinute = (alarmMinute + 1) % 60; // Incrémenter les minutes de l'alarme
+    }
+
+    if (digitalRead(BTN_DOWN) == LOW && millis() - lastButtonPress > 200) {
+      lastButtonPress = millis();
+      alarmMinute = (alarmMinute - 1 + 60) % 60; // Décrémenter les minutes de l'alarme
+    }
+
+    if (digitalRead(BTN_SELECT) == LOW && millis() - lastButtonPress > 200) {
+      lastButtonPress = millis();
+      // Confirmer les minutes et quitter
+      break;
+    }
+
+    // Afficher les minutes de l'alarme en cours de réglage
+    afficheChiffre(2, alarmMinute / 10); // Dizaines de minutes
+    afficheChiffre(3, alarmMinute % 10); // Unités de minutes
+  }
+
+  // Activer l'alarme
+  alarmEnabled = true;
+}
+void gererBoutons() {
+  // Debounce logic
+  if (millis() - lastButtonPress < 200) return;
+
+  if (digitalRead(BTN_DOWN) == LOW) {
+    lastButtonPress = millis();
+    menuState = (menuState + 1) % 3; // Circular menu navigation
+  }
+
+  if (digitalRead(BTN_UP) == LOW) {
+    lastButtonPress = millis();
+    menuState = (menuState - 1 + 3) % 3; // Circular menu navigation
+  }
+
+  if (digitalRead(BTN_SELECT) == LOW) {
+    lastButtonPress = millis();
+    switch(menuState) {
+      case 1:
+        reglageHeure();
+        break;
+      case 2:
+        reglageAlarme();
+        break;
+    }
+  }
+}
+
+void boucleMenu() {
+  if (menuState == 0) {
+    afficheHeures();
+  } else if (menuState == 1) {
+    // Afficher "Réglage Heure"
+    lc.clearDisplay(0);
+    afficheChiffre(0, 0); // Ex. afficher "1"
+  } else if (menuState == 2) {
+    // Afficher "Réglage Alarme"
+    lc.clearDisplay(0);
+    afficheChiffre(0, 2); // Ex. afficher "2"
+  }
+}
+
+void loop() {
+  DateTime now = rtc.now();
+
+  gererBoutons();
+  boucleMenu();
+  afficherMenuOLED();
+
+  // Clignotement du séparateur
+  if (now.second() % 2 == 0) {
+    afficheSeparateur();
+  } else {
+    lc.setLed(1, 2, 7, false);
+    lc.setLed(1, 5, 7, false);
+  }
+
+  // Gestion alarme
+  if (alarmEnabled && now.hour() == alarmHour && now.minute() == alarmMinute) {
+    alarmActive = true; // Set alarm active when time matches
+  }
+
+  if (alarmActive) {
+    long distance = getDistance();
+  
+    if (distance > 0 && distance < 10) { // Détection d'une main
+      Serial.println("Snooze activé !");
+      alarmActive = false; 
+      noTone(BUZZER_PIN); // Stop the buzzer
+      // Add RTC time adjustment for snooze
+      rtc.adjust(DateTime(now.year(), now.month(), now.day(), now.hour(), now.minute() + snoozeTime, now.second()));
+      delay(snoozeDuration * 1000); // Attendre le temps du snooze
+    }
+
+    if (digitalRead(STOP_ALARM_BUTTON) == LOW) {
+      Serial.println("Alarme arrêtée !");
+      alarmActive = false;
+      noTone(BUZZER_PIN); // Stop the buzzer
+      return; // Exit the alarm state
+    }
+
+    // Continue playing melody if alarm is still active
+    playMelody();
+  }
+}
