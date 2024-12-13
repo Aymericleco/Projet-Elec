@@ -1,0 +1,641 @@
+#include <SPI.h>
+#include <Wire.h>
+#include <RTClib.h>
+#include <LedControl.h>
+#include <EEPROM.h>
+#include <ss_oled.h>
+
+#define BUZZER_PIN 9
+
+// Paramètres I2C et OLED
+#define SDA_PIN -1
+#define SCL_PIN -1
+#define RESET_PIN -1
+#define OLED_ADDR -1
+#define FLIP180 0
+#define INVERT 0
+#define USE_HW_I2C 1
+#define MY_OLED OLED_128x64
+#define OLED_WIDTH 128
+#define OLED_HEIGHT 64
+
+SSOLED ssoled;
+
+// RTC
+RTC_DS1307 rtc;
+
+// Deux alarmes
+int alarmHours[2] = {7, 8};
+int alarmMinutes[2] = {0, 30};
+bool alarmSet[2] = {false, false};
+bool alarmPlaying[2] = {false, false};
+int currentAlarmIndex = 0; // 0 ou 1
+
+// Boutons
+#define BTN_NAVIGATE 7
+#define BTN_SELECT 5
+#define BTN_STOP_ALARM 4
+
+// Ultrason
+#define TRIG_PIN 2
+#define ECHO_PIN 3
+int snoozeMinutes = 5;
+int distanceThreshold = 15; // cm
+
+// LED d'alarme
+#define LED_ALARM_PIN 6 // Broche pour la LED d'alarme
+
+// Matrices LED
+#define NUM_MATRICES 4
+#define DIN_PIN_LED 11
+#define CLK_PIN_LED 13
+#define CS_PIN_LED 10
+LedControl lc = LedControl(DIN_PIN_LED, CLK_PIN_LED, CS_PIN_LED, NUM_MATRICES);
+
+// Chiffres binaires pour affichage heures sur LED
+const byte chiffresBinaire[10][8] = {
+  {0b00111100,0b01000010,0b01000010,0b01000010,0b01000010,0b01000010,0b01000010,0b00111100}, //0
+  {0b00001000,0b00011000,0b00101000,0b00001000,0b00001000,0b00001000,0b00001000,0b00111110}, //1
+  {0b00111100,0b01000010,0b00000010,0b00001100,0b00110000,0b01000000,0b01000010,0b00111110}, //2
+  {0b00111100,0b01000010,0b00000010,0b00011100,0b00000010,0b00000010,0b01000010,0b00111100}, //3
+  {0b00000100,0b00001100,0b00010100,0b00100100,0b01000100,0b01111110,0b00000100,0b00000100}, //4
+  {0b01111110,0b01000000,0b01000000,0b01111100,0b00000010,0b00000010,0b01000010,0b00111100}, //5
+  {0b00111100,0b01000010,0b01000000,0b01111100,0b01000010,0b01000010,0b01000010,0b00111100}, //6
+  {0b01111110,0b00000010,0b00000100,0b00001000,0b00010000,0b00100000,0b01000000,0b01000000}, //7
+  {0b00111100,0b01000010,0b01000010,0b00111100,0b01000010,0b01000010,0b01000010,0b00111100}, //8
+  {0b00111100,0b01000010,0b01000010,0b01000010,0b00111110,0b00000010,0b01000010,0b00111100}  //9
+};
+
+// États du menu
+enum MenuState {
+  MAIN_MENU,
+  CHANGE_TIME_HOURS,
+  CHANGE_TIME_MINUTES,
+  SUCCESS_SCREEN,
+  ALARM_HOURS,
+  ALARM_MINUTES,
+  ALARM_SELECTION,
+  SET_SNOOZE // Nouvel état pour définir le snooze
+};
+
+// Renommer les options de menu pour plus de clarté
+const char* menuOptions[] = {
+  "Regler l'alarme",
+  "Changer l'heure du reveil",
+  "Changer le format (12h/24h)",
+  "Choix Alarme",
+  "Set Snooze Time" // Nouvelle option pour définir le snooze
+};
+const int NUM_OPTIONS = 5;
+
+// Variables de menu
+int currentMenuIndex = 0;
+MenuState currentState = MAIN_MENU;
+unsigned long lastButtonPress = 0;
+int adjustedHours = 0;
+int adjustedMinutes = 0;
+bool is24HourFormat = true;
+
+// Mélodie
+int nombreDe_notes = 0;
+int alarmEEPROMAddr = 0;
+int currentNoteIndex = 0;
+unsigned long alarmStartTime = 0;
+unsigned long noteStartTime = 0;
+int currentNoteDuration = 0;
+int currentFrequency = 0;
+bool notePlaying = false;
+
+// Options de snooze
+const int snoozeOptions[] = {5, 10, 15, 30};
+const int NUM_SNOOZE_OPTIONS = 4;
+int currentSnoozeOptionIndex = 0;
+
+// Déclaration de readMelodyFromEEPROM avec deux paramètres
+int readMelodyFromEEPROM(int addr, int &nombreDe_notes);
+
+// Fonction d'affichage
+void clearDisplay() {
+  oledFill(&ssoled, 0, 1);
+}
+
+void oledPrintLine(int line, const char* text, bool invert=false) {
+  oledWriteString(&ssoled, 0, 0, line, (char*)text, FONT_NORMAL, invert ? 1 : 0, 1);
+}
+
+// Fonction pour mettre à jour l'état de la LED d'alarme
+void updateAlarmLED() {
+  if(alarmPlaying[0] || alarmPlaying[1]) {
+    digitalWrite(LED_ALARM_PIN, HIGH); // Allumer la LED si une alarme est active
+  } else {
+    digitalWrite(LED_ALARM_PIN, LOW); // Éteindre la LED si aucune alarme n'est active
+  }
+}
+
+// Fonctions d'affichage
+
+void displayMenu() {
+  clearDisplay();
+  
+  oledPrintLine(0, "MENU PRINCIPAL:");
+  oledDrawLine(&ssoled, 0, 10, OLED_WIDTH-1, 10, 1);
+  
+  for(int i = 0; i < NUM_OPTIONS; i++) {
+    if(i == currentMenuIndex) {
+      char buffer[30];
+      sprintf(buffer, "> %s", menuOptions[i]);
+      oledPrintLine(2 + i, buffer, true);
+    }
+    else {
+      char buffer[30];
+      sprintf(buffer, "  %s", menuOptions[i]);
+      oledPrintLine(2 + i, buffer);
+    }
+  }
+  
+  // Supprimer l'affichage des alarmes
+  oledPrintLine(6, ""); // Ligne 6 vide
+  oledPrintLine(7, ""); // Ligne 7 vide
+}
+
+void displayAlarmSelection() {
+  clearDisplay();
+  
+  oledPrintLine(0, "CHOISIR ALARME:");
+  oledDrawLine(&ssoled, 0, 10, OLED_WIDTH-1, 10, 1);
+  
+  for(int i = 0; i < 2; i++) {
+    if(i == currentAlarmIndex) {
+      char buffer[20];
+      sprintf(buffer, "> Alarme %d", i+1);
+      oledPrintLine(2 + i, buffer, true);
+    }
+    else {
+      char buffer[20];
+      sprintf(buffer, "  Alarme %d", i+1);
+      oledPrintLine(2 + i, buffer);
+    }
+  }
+}
+
+void displaySnoozeSelection() {
+  clearDisplay();
+  
+  oledPrintLine(0, "Set Snooze Time:");
+  oledDrawLine(&ssoled, 0, 10, OLED_WIDTH-1, 10, 1);
+  
+  for(int i = 0; i < NUM_SNOOZE_OPTIONS; i++) {
+    if(i == currentSnoozeOptionIndex) {
+      char buffer[20];
+      sprintf(buffer, "> %d minutes", snoozeOptions[i]);
+      oledPrintLine(2 + i, buffer, true); // Ligne active en inversé
+    }
+    else {
+      char buffer[20];
+      sprintf(buffer, "  %d minutes", snoozeOptions[i]);
+      oledPrintLine(2 + i, buffer); // Autres lignes normales
+    }
+  }
+}
+
+void drawTimeAdjustmentScreen(bool isHours) {
+  clearDisplay();
+  if(isHours) {
+    oledPrintLine(0, "Ajuster Heures:");
+    char buffer[20];
+    sprintf(buffer, "Heures: %d", adjustedHours);
+    oledPrintLine(1, buffer);
+  }
+  else {
+    oledPrintLine(0, "Ajuster Minutes:");
+    char buffer[20];
+    sprintf(buffer, "Minutes: %d", adjustedMinutes);
+    oledPrintLine(1, buffer);
+  }
+}
+
+void drawAlarmAdjustmentScreen(bool isHours) {
+  clearDisplay();
+  if(isHours) {
+    oledPrintLine(0, "Ajuster Heures Alarme:");
+    char buffer[20];
+    sprintf(buffer, "Heures: %d", alarmHours[currentAlarmIndex]);
+    oledPrintLine(1, buffer);
+  }
+  else {
+    oledPrintLine(0, "Ajuster Minutes Alarme:");
+    char buffer[20];
+    sprintf(buffer, "Minutes: %d", alarmMinutes[currentAlarmIndex]);
+    oledPrintLine(1, buffer);
+  }
+}
+
+void drawFormatChangedScreen() {
+  clearDisplay();
+  oledPrintLine(0, "Format change!");
+  oledPrintLine(1, ""); // Ligne vide pour espace
+}
+
+// Affichage des chiffres sur les matrices LED
+void afficheChiffre(int matrice, int chiffre) {
+  for (int row = 0; row < 8; row++) {
+    lc.setRow(matrice, row, chiffresBinaire[chiffre][row]);
+  }
+}
+
+// Afficher l'heure sur les matrices LED
+void afficheHeures() {
+  DateTime now = rtc.now();
+  int heures, minutes;
+
+  if (currentState == CHANGE_TIME_HOURS || currentState == CHANGE_TIME_MINUTES) {
+    heures = adjustedHours;
+    minutes = adjustedMinutes;
+  }
+  else {
+    heures = now.hour();
+    minutes = now.minute();
+  }
+  
+  if (!is24HourFormat && heures > 12) {
+    heures -= 12;
+  }
+
+  int h1 = heures / 10;
+  int h2 = heures % 10;
+  int m1 = minutes / 10;
+  int m2 = minutes % 10;
+
+  afficheChiffre(3, h1);
+  afficheChiffre(2, h2);
+  afficheChiffre(1, m1);
+  afficheChiffre(0, m2);
+}
+
+// Afficher un séparateur sur les matrices LED
+void afficheSeparateur() {
+  lc.setLed(2, 2, 7, true);
+  lc.setLed(2, 5, 7, true);
+}
+
+// Définition de readMelodyFromEEPROM avec deux paramètres
+int readMelodyFromEEPROM(int addr, int &nombreDe_notes) {
+  nombreDe_notes = (EEPROM.read(addr) << 8) | EEPROM.read(addr + 1);
+  addr += 2;
+  return addr;
+}
+
+// Fonction pour arrêter complètement l'alarme
+void stopAlarmCompletely(int alarmIndex) { // Modifié pour prendre l'index de l'alarme
+  noTone(BUZZER_PIN);
+  alarmPlaying[alarmIndex] = false;
+  alarmSet[alarmIndex] = false;
+
+  updateAlarmLED(); // Mettre à jour la LED d'alarme
+}
+
+// Fonction pour démarrer l'alarme
+void startAlarm() {
+  alarmPlaying[currentAlarmIndex] = true;
+  alarmStartTime = millis();
+  currentNoteIndex = 0;
+
+  // Définir l'adresse EEPROM en fonction de l'alarme active
+  int MELODY1_ADDR = 0;
+  int MELODY2_ADDR = 100;
+  int addr = (currentAlarmIndex == 0) ? MELODY1_ADDR : MELODY2_ADDR;
+
+  // Lire la mélodie depuis EEPROM
+  nombreDe_notes = 0;
+  alarmEEPROMAddr = readMelodyFromEEPROM(addr, nombreDe_notes);
+
+  if (nombreDe_notes > 0) {
+    currentFrequency = (EEPROM.read(alarmEEPROMAddr) << 8) | EEPROM.read(alarmEEPROMAddr + 1);
+    alarmEEPROMAddr += 2;
+    currentNoteDuration = (EEPROM.read(alarmEEPROMAddr) << 8) | EEPROM.read(alarmEEPROMAddr + 1);
+    alarmEEPROMAddr += 2;
+
+    tone(BUZZER_PIN, currentFrequency);
+    noteStartTime = millis();
+    notePlaying = true;
+  }
+  else {
+    // Si aucune mélodie, définir une tonalité simple pour Alarme 2
+    if(currentAlarmIndex == 1) {
+      tone(BUZZER_PIN, 1000); // Tonalité simple
+      alarmStartTime = millis();
+      notePlaying = true;
+    }
+    else {
+      stopAlarmCompletely(currentAlarmIndex);
+    }
+  }
+
+  updateAlarmLED(); // Mettre à jour la LED d'alarme
+}
+
+// Fonction pour mettre à jour l'alarme (lecture non bloquante)
+void updateAlarm() {
+  if (!alarmPlaying[currentAlarmIndex]) return;
+
+  unsigned long now = millis();
+
+  // Si plus de 10 secondes se sont écoulées depuis le début de l'alarme, arrêter
+  if (now - alarmStartTime > 10000) {
+    stopAlarmCompletely(currentAlarmIndex);
+    return;
+  }
+
+  // Vérifier si la note courante est terminée
+  if (notePlaying && now - noteStartTime >= (unsigned long)currentNoteDuration) {
+    noTone(BUZZER_PIN);
+    notePlaying = false;
+    currentNoteIndex++;
+
+    if (currentAlarmIndex == 1) {
+      // Alarme 2 a une tonalité simple, on arrête après une seule tonalité
+      stopAlarmCompletely(currentAlarmIndex);
+      return;
+    }
+
+    if (currentNoteIndex < nombreDe_notes) {
+      currentFrequency = (EEPROM.read(alarmEEPROMAddr) << 8) | EEPROM.read(alarmEEPROMAddr + 1);
+      alarmEEPROMAddr += 2;
+      currentNoteDuration = (EEPROM.read(alarmEEPROMAddr) << 8) | EEPROM.read(alarmEEPROMAddr + 1);
+      alarmEEPROMAddr += 2;
+
+      tone(BUZZER_PIN, currentFrequency);
+      noteStartTime = millis();
+      notePlaying = true;
+    }
+    else {
+      stopAlarmCompletely(currentAlarmIndex);
+    }
+  }
+}
+
+// Fonction pour mesurer la distance avec l'ultrason
+long measureDistance() {
+  digitalWrite(TRIG_PIN, LOW);
+  delayMicroseconds(2);
+  digitalWrite(TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(TRIG_PIN, LOW);
+
+  long duration = pulseIn(ECHO_PIN, HIGH);
+  long distance = duration * 0.034 / 2; 
+  return distance;
+}
+
+// Fonction pour vérifier l'ultrason et activer le snooze
+void checkUltrasonicForSnooze() {
+  for(int i = 0; i < 2; i++) {
+    if(alarmPlaying[i]) {
+      long distance = measureDistance();
+      if (distance > 0 && distance < distanceThreshold) {
+        noTone(BUZZER_PIN);
+        alarmPlaying[i] = false;
+        alarmMinutes[i] += snoozeMinutes;
+        if (alarmMinutes[i] >= 60) {
+          alarmMinutes[i] -= 60;
+          alarmHours[i] = (alarmHours[i] + 1) % 24;
+        }
+        alarmSet[i] = true;
+
+        updateAlarmLED(); // Mettre à jour la LED d'alarme
+      }
+    }
+  }
+}
+
+// Fonction pour vérifier les alarmes
+void checkAlarm() {
+  DateTime now = rtc.now();
+  for(int i = 0; i < 2; i++) {
+    if(alarmSet[i] && !alarmPlaying[i]) {
+      if(now.hour() == alarmHours[i] && now.minute() == alarmMinutes[i]) {
+        currentAlarmIndex = i;
+        startAlarm();
+      }
+    }
+  }
+}
+
+// Gestion de la navigation via les boutons
+void handleNavigation() {
+  // Bouton d'arrêt d'alarme (D4)
+  for(int i = 0; i < 2; i++) {
+    if(alarmPlaying[i] && digitalRead(BTN_STOP_ALARM) == LOW) {
+      stopAlarmCompletely(i);
+      lastButtonPress = millis();
+      return;
+    }
+  }
+
+  if (millis() - lastButtonPress < 200) return;
+
+  if (digitalRead(BTN_NAVIGATE) == LOW) {
+    lastButtonPress = millis();
+
+    switch(currentState) {
+      case MAIN_MENU:
+        currentMenuIndex = (currentMenuIndex + 1) % NUM_OPTIONS;
+        displayMenu();
+        break;
+      
+      case CHANGE_TIME_HOURS:
+        adjustedHours = (adjustedHours + 1) % 24;
+        drawTimeAdjustmentScreen(true);
+        break;
+      
+      case CHANGE_TIME_MINUTES:
+        adjustedMinutes = (adjustedMinutes + 1) % 60;
+        drawTimeAdjustmentScreen(false);
+        break;
+
+      case ALARM_HOURS:
+        alarmHours[currentAlarmIndex] = (alarmHours[currentAlarmIndex] + 1) % 24;
+        drawAlarmAdjustmentScreen(true);
+        break;
+
+      case ALARM_MINUTES:
+        alarmMinutes[currentAlarmIndex] = (alarmMinutes[currentAlarmIndex] + 1) % 60;
+        drawAlarmAdjustmentScreen(false);
+        break;
+
+      case ALARM_SELECTION:
+        currentAlarmIndex = (currentAlarmIndex + 1) % 2;
+        displayAlarmSelection();
+        break;
+
+      case SET_SNOOZE:
+        currentSnoozeOptionIndex = (currentSnoozeOptionIndex + 1) % NUM_SNOOZE_OPTIONS;
+        displaySnoozeSelection();
+        break;
+
+      default:
+        break;
+    }
+  }
+
+  if (digitalRead(BTN_SELECT) == LOW) {
+    lastButtonPress = millis();
+
+    switch(currentState) {
+      case MAIN_MENU:
+        if (currentMenuIndex == 0) { // Régler l'alarme
+          currentState = ALARM_SELECTION;
+          displayAlarmSelection();
+        }
+        else if (currentMenuIndex == 1) { // Changer l'heure du réveil
+          DateTime now = rtc.now();
+          adjustedHours = now.hour();
+          adjustedMinutes = now.minute();
+          currentState = CHANGE_TIME_HOURS;
+          drawTimeAdjustmentScreen(true);
+        }
+        else if (currentMenuIndex == 2) { // Changer le format
+          is24HourFormat = !is24HourFormat;
+          drawFormatChangedScreen();
+          delay(1000);
+          currentState = MAIN_MENU;
+          displayMenu();
+        }
+        else if (currentMenuIndex == 3) { // Choix Alarme
+          currentState = ALARM_SELECTION;
+          displayAlarmSelection();
+        }
+        else if (currentMenuIndex == 4) { // Set Snooze Time
+          currentState = SET_SNOOZE;
+          displaySnoozeSelection();
+        }
+        break;
+     
+      case ALARM_SELECTION:
+        currentState = ALARM_HOURS;
+        drawAlarmAdjustmentScreen(true);
+        break;
+
+      case ALARM_HOURS:
+        currentState = ALARM_MINUTES;
+        drawAlarmAdjustmentScreen(false);
+        break;
+
+      case ALARM_MINUTES:
+        alarmSet[currentAlarmIndex] = true;
+        currentState = MAIN_MENU;
+        displayMenu();
+        break;
+
+      case CHANGE_TIME_HOURS:
+        currentState = CHANGE_TIME_MINUTES;
+        drawTimeAdjustmentScreen(false);
+        break;
+      
+      case CHANGE_TIME_MINUTES:
+        {
+          DateTime now = rtc.now();
+          DateTime newTime = DateTime(now.year(), now.month(), now.day(), 
+                                      adjustedHours, adjustedMinutes, 0);
+          rtc.adjust(newTime);
+        }
+        currentState = MAIN_MENU;
+        displayMenu();
+        break;
+      
+      case SUCCESS_SCREEN:
+        currentState = MAIN_MENU;
+        displayMenu();
+        break;
+
+      case SET_SNOOZE:
+        // Définir snoozeMinutes basé sur la sélection
+        snoozeMinutes = snoozeOptions[currentSnoozeOptionIndex];
+        // Afficher une confirmation
+        clearDisplay();
+        oledPrintLine(0, "Snooze set to:");
+        char buffer[20];
+        sprintf(buffer, "%d minutes", snoozeMinutes);
+        oledPrintLine(1, buffer);
+        delay(1000);
+        currentState = MAIN_MENU;
+        displayMenu();
+        break;
+    
+      default:
+        break;
+    }
+  }
+}
+
+void setup() {
+  Serial.begin(9600);
+
+  // Initialisation des matrices LED
+  for (int i = 0; i < NUM_MATRICES; i++) {
+    lc.shutdown(i, false);     
+    lc.setIntensity(i, 10);     
+    lc.clearDisplay(i);         
+  }
+  
+  // Initialisation du RTC
+  if (!rtc.begin()) {
+    while (1);
+  }
+
+  if (!rtc.isrunning()) {
+    rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));
+  }
+
+  // Initialisation de l'OLED
+  // Suppression de la variable 'rc' car elle est inutilisée
+  oledInit(&ssoled, MY_OLED, OLED_ADDR, FLIP180, INVERT, USE_HW_I2C, SDA_PIN, SCL_PIN, RESET_PIN, 400000L);
+
+  // Configuration des broches
+  pinMode(BTN_NAVIGATE, INPUT_PULLUP);
+  pinMode(BTN_SELECT, INPUT_PULLUP);
+  pinMode(BTN_STOP_ALARM, INPUT_PULLUP);
+  pinMode(BUZZER_PIN, OUTPUT);
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
+  
+  // Configuration de la LED d'alarme
+  pinMode(LED_ALARM_PIN, OUTPUT);
+  digitalWrite(LED_ALARM_PIN, LOW); // Éteindre la LED au démarrage
+
+  currentState = MAIN_MENU;
+  
+  afficheHeures();
+  displayMenu();
+}
+
+void loop() {
+  afficheHeures();
+
+  // Clignotement du séparateur
+  if (millis() / 500 % 2 == 0) {
+    afficheSeparateur();
+  }
+  else {
+    lc.setLed(2, 2, 7, false);
+    lc.setLed(2, 5, 7, false);
+  }
+
+  handleNavigation();
+  checkAlarm();
+  updateAlarm();
+  checkUltrasonicForSnooze();
+
+  switch(currentState) {
+    case CHANGE_TIME_HOURS:
+      drawTimeAdjustmentScreen(true);
+      break;
+    case CHANGE_TIME_MINUTES:
+      drawTimeAdjustmentScreen(false);
+      break;
+    default:
+      break;
+  }
+
+  delay(50);
+}
