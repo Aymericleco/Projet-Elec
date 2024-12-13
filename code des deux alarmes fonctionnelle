@@ -1,0 +1,521 @@
+#include <SPI.h>
+#include <Wire.h>
+#include <RTClib.h>
+#include <LedControl.h>
+#include <EEPROM.h>
+#include <ss_oled.h>
+
+#define BUZZER_PIN 9
+
+// Paramètres I2C et OLED
+#define SDA_PIN -1
+#define SCL_PIN -1
+#define RESET_PIN -1
+#define OLED_ADDR -1
+#define FLIP180 0
+#define INVERT 0
+#define USE_HW_I2C 1
+#define MY_OLED OLED_128x64
+#define OLED_WIDTH 128
+#define OLED_HEIGHT 64
+#define NOTE_C4  262
+#define NOTE_E4  330
+#define NOTE_G4  392
+#define NOTE_C5  523
+unsigned long melodyStartTime = 0; // Temps de début de la mélodie  
+#define NOTE_D4  294
+#define NOTE_F4  349
+#define NOTE_A4  440
+#define NOTE_D5  587
+unsigned long melodyStartTimeAlarm2 = 0; // Temps de début de la mélodie pour l'alarme 2
+int currentNoteIndexAlarm2 = 0; // Index de la note en cours pour l'alarme 2
+
+
+int melodyAlarm2[] = {NOTE_D4, NOTE_F4, NOTE_A4, NOTE_D5};
+int noteDurationsAlarm2[] = {400, 400, 400, 400}; // Durée de chaque note en millisecondes
+int melodyLengthAlarm2 = 4; // Nombre de notes pour l'alarme 2
+
+
+
+int melody[] = {NOTE_C4, NOTE_E4, NOTE_G4, NOTE_C5};
+int noteDurations[] = {500, 500, 500, 500}; // Durée de chaque note en millisecondes
+int melodyLength = 4; // Nombre de notes
+
+SSOLED ssoled;
+
+// RTC
+RTC_DS1307 rtc;
+
+// Deux alarmes
+int alarmHours[2] = {7, 8};
+int alarmMinutes[2] = {0, 30};
+bool alarmSet = false;
+bool alarmPlaying = false;
+int currentAlarmIndex = 0; // 0 ou 1
+
+// Boutons
+#define BTN_NAVIGATE 7
+#define BTN_SELECT 5
+#define BTN_STOP_ALARM 4
+
+// Ultrason
+#define TRIG_PIN 2
+#define ECHO_PIN 3
+int snoozeMinutes = 5;
+int distanceThreshold = 15; // cm
+
+// Matrices LED
+#define NUM_MATRICES 4
+#define DIN_PIN 11
+#define CLK_PIN 13
+#define CS_PIN 10
+LedControl lc = LedControl(DIN_PIN, CLK_PIN, CS_PIN, NUM_MATRICES);
+
+// Chiffres binaires pour affichage heures sur LED
+const byte chiffresBinaire[10][8] = {
+  {0b00111100,0b01000010,0b01000010,0b01000010,0b01000010,0b01000010,0b01000010,0b00111100}, //0
+  {0b00001000,0b00011000,0b00101000,0b00001000,0b00001000,0b00001000,0b00001000,0b00111110}, //1
+  {0b00111100,0b01000010,0b00000010,0b00001100,0b00110000,0b01000000,0b01000010,0b00111110}, //2
+  {0b00111100,0b01000010,0b00000010,0b00011100,0b00000010,0b00000010,0b01000010,0b00111100}, //3
+  {0b00000100,0b00001100,0b00010100,0b00100100,0b01000100,0b01111110,0b00000100,0b00000100}, //4
+  {0b01111110,0b01000000,0b01000000,0b01111100,0b00000010,0b00000010,0b01000010,0b00111100}, //5
+  {0b00111100,0b01000010,0b01000000,0b01111100,0b01000010,0b01000010,0b01000010,0b00111100}, //6
+  {0b01111110,0b00000010,0b00000100,0b00001000,0b00010000,0b00100000,0b01000000,0b01000000}, //7
+  {0b00111100,0b01000010,0b01000010,0b00111100,0b01000010,0b01000010,0b01000010,0b00111100}, //8
+  {0b00111100,0b01000010,0b01000010,0b01000010,0b00111110,0b00000010,0b01000010,0b00111100}  //9
+};
+
+enum MenuState {
+  MAIN_MENU,
+  CHANGE_TIME_HOURS,
+  CHANGE_TIME_MINUTES,
+  SUCCESS_SCREEN,
+  ALARM_HOURS,
+  ALARM_MINUTES,
+  ALARM_SELECTION
+};
+
+int currentMenuIndex = 0; // 0: SET ALARME, 1: CHANGER L HEURE, 2: FORMAT 12H/24H, 3: CHOIX ALARME
+MenuState currentState = MAIN_MENU;
+unsigned long lastButtonPress = 0;
+int adjustedHours = 0;
+int adjustedMinutes = 0;
+bool is24HourFormat = true;
+
+// Mélodie
+int nombreDeNotes = 0;
+int alarmEEPROMAddr = 0;
+int currentNoteIndex = 0;
+unsigned long alarmStartTime = 0;
+unsigned long noteStartTime = 0;
+int currentNoteDuration = 0;
+int currentFrequency = 0;
+bool notePlaying = false;
+
+void clearDisplay() {
+  oledFill(&ssoled, 0, 1);
+}
+
+void oledPrintLine(int line, const char* text, bool invert=false) {
+  oledWriteString(&ssoled,0,0,line,(char*)text,FONT_NORMAL,invert?1:0,1);
+}
+
+// Fonctions d'affichage
+
+void displayMenu() {
+  clearDisplay();
+  
+  oledPrintLine(0,"MENU");
+  oledPrintLine(1,"");
+  oledDrawLine(&ssoled,0,10,OLED_WIDTH-1,10,1);
+  oledPrintLine(2,"");
+  
+  oledPrintLine(3,"SET ALARME",(currentMenuIndex==0));
+  oledPrintLine(4,"CHANGER L HEURE",(currentMenuIndex==1));
+  oledPrintLine(5,"FORMAT 12H/24H",(currentMenuIndex==2));
+  oledPrintLine(6,"CHOIX ALARME",(currentMenuIndex==3));
+  oledPrintLine(7,"");
+}
+
+void displayAlarmSelection() {
+  clearDisplay();
+  
+  oledPrintLine(0,"CHOISIR ALARME");
+  oledPrintLine(1,"");
+  oledDrawLine(&ssoled,0,10,OLED_WIDTH-1,10,1);
+  oledPrintLine(2,"");
+  
+  oledPrintLine(3,"Alarme 1",(currentAlarmIndex==0));
+  oledPrintLine(4,"Alarme 2",(currentAlarmIndex==1));
+}
+
+void drawTimeAdjustmentScreen(bool isHours) {
+  clearDisplay();
+  oledPrintLine(0,(isHours?"Ajuster Heures:":"Ajuster Minutes:"));
+  char buffer[20];
+  if (isHours) sprintf(buffer,"Heures: %d",adjustedHours);
+  else sprintf(buffer,"Minutes: %d",adjustedMinutes);
+  oledPrintLine(1,buffer);
+}
+
+void drawAlarmAdjustmentScreen(bool isHours) {
+  clearDisplay();
+  oledPrintLine(0,(isHours?"Ajuster Heures Alarme:":"Ajuster Minutes Alarme:"));
+  char buffer[20];
+  if (isHours) sprintf(buffer,"Heures: %d",alarmHours[currentAlarmIndex]);
+  else sprintf(buffer,"Minutes: %d",alarmMinutes[currentAlarmIndex]);
+  oledPrintLine(1,buffer);
+}
+
+void drawFormatChangedScreen() {
+  clearDisplay();
+  oledPrintLine(0,"Format change!");
+}
+
+void afficheChiffre(int matrice, int chiffre) {
+  for (int row = 0; row < 8; row++) {
+    lc.setRow(matrice, row, chiffresBinaire[chiffre][row]);
+  }
+}
+
+void afficheHeures() {
+  DateTime now = rtc.now();
+  int heures, minutes;
+
+  if (currentState == CHANGE_TIME_HOURS || currentState == CHANGE_TIME_MINUTES) {
+    heures = adjustedHours;
+    minutes = adjustedMinutes;
+  } else {
+    heures = now.hour();
+    minutes = now.minute();
+  }
+  
+  if (!is24HourFormat && heures > 12) {
+    heures -= 12;
+  }
+
+  int h1 = heures / 10;
+  int h2 = heures % 10;
+  int m1 = minutes / 10;
+  int m2 = minutes % 10;
+
+  afficheChiffre(3, h1);
+  afficheChiffre(2, h2);
+  afficheChiffre(1, m1);
+  afficheChiffre(0, m2);
+}
+
+void afficheSeparateur() {
+  lc.setLed(2, 2, 7, true);
+  lc.setLed(2, 5, 7, true);
+}
+
+int readMelodyFromEEPROM(int &nombreDeNotes) {
+  int addr = 0;
+  nombreDeNotes = (EEPROM.read(addr) << 8) | EEPROM.read(addr+1);
+  addr += 2;
+  return addr; 
+}
+
+void stopAlarmCompletely() {
+  noTone(BUZZER_PIN);
+  alarmPlaying = false;
+  alarmSet = false;
+  currentNoteIndex = 0; // Réinitialisation de la mélodie 1
+  currentNoteIndexAlarm2 = 0; // Réinitialisation de la mélodie 2
+}
+
+void playNextNote() {
+  unsigned long now = millis();
+  if (now - melodyStartTime >= 10000) { // Si 10 secondes écoulées
+    stopAlarmCompletely();
+    return;
+  }
+
+  if (currentNoteIndex < melodyLength) {
+    tone(BUZZER_PIN, melody[currentNoteIndex]);
+    noteStartTime = millis();
+    currentNoteDuration = noteDurations[currentNoteIndex];
+    currentNoteIndex++;
+  } else {
+    // Redémarrer la mélodie
+    currentNoteIndex = 0;
+    playNextNote();
+  }
+}
+void playNextNoteAlarm2() {
+  unsigned long now = millis();
+  if (now - melodyStartTimeAlarm2 >= 10000) { // Si 10 secondes écoulées
+    stopAlarmCompletely();
+    return;
+  }
+
+  if (currentNoteIndexAlarm2 < melodyLengthAlarm2) {
+    tone(BUZZER_PIN, melodyAlarm2[currentNoteIndexAlarm2]);
+    noteStartTime = millis();
+    currentNoteDuration = noteDurationsAlarm2[currentNoteIndexAlarm2];
+    currentNoteIndexAlarm2++;
+  } else {
+    // Redémarrer la mélodie
+    currentNoteIndexAlarm2 = 0;
+    playNextNoteAlarm2();
+  }
+}
+
+
+
+void startAlarm() {
+  alarmPlaying = true;
+  alarmStartTime = millis();
+
+  if (currentAlarmIndex == 0) { // Si c'est l'alarme 1
+    melodyStartTime = millis();
+    currentNoteIndex = 0;
+    playNextNote();
+  } else if (currentAlarmIndex == 1) { // Si c'est l'alarme 2
+    melodyStartTimeAlarm2 = millis();
+    currentNoteIndexAlarm2 = 0;
+    playNextNoteAlarm2();
+  }
+}
+
+
+
+
+
+void updateAlarm() {
+  if (!alarmPlaying) return;
+
+  unsigned long now = millis();
+
+  // Gestion de la mélodie pour l'alarme 1
+  if (currentAlarmIndex == 0 && now - noteStartTime >= currentNoteDuration) {
+    playNextNote();
+  }
+
+  // Gestion de la mélodie pour l'alarme 2
+  if (currentAlarmIndex == 1 && now - noteStartTime >= currentNoteDuration) {
+    playNextNoteAlarm2();
+  }
+}
+
+
+
+
+
+long measureDistance() {
+  digitalWrite(TRIG_PIN, LOW);
+  delayMicroseconds(2);
+  digitalWrite(TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(TRIG_PIN, LOW);
+
+  long duration = pulseIn(ECHO_PIN, HIGH);
+  long distance = duration * 0.034 / 2; 
+  return distance;
+}
+
+void checkUltrasonicForSnooze() {
+  if (alarmPlaying) {
+    long distance = measureDistance();
+    if (distance > 0 && distance < distanceThreshold) {
+      noTone(BUZZER_PIN);
+      alarmPlaying = false;
+      alarmMinutes[currentAlarmIndex] += snoozeMinutes;
+      if (alarmMinutes[currentAlarmIndex] >= 60) {
+        alarmMinutes[currentAlarmIndex] -= 60;
+        alarmHours[currentAlarmIndex] = (alarmHours[currentAlarmIndex] + 1) % 24;
+      }
+      alarmSet = true;
+    }
+  }
+}
+
+void checkAlarm() {
+  if (alarmSet && !alarmPlaying) {
+    DateTime now = rtc.now();
+    // On déclenche l'alarme si l'heure correspond à l'alarme sélectionnée
+    if (now.hour() == alarmHours[currentAlarmIndex] && now.minute() == alarmMinutes[currentAlarmIndex]) {
+      startAlarm();
+    }
+  }
+}
+
+void handleNavigation() {
+  if (alarmPlaying && digitalRead(BTN_STOP_ALARM) == LOW) {
+    stopAlarmCompletely();
+    lastButtonPress = millis();
+    return;
+  }
+
+  if (millis() - lastButtonPress < 200) return;
+
+  if (digitalRead(BTN_NAVIGATE) == LOW) {
+    lastButtonPress = millis();
+    
+    switch(currentState) {
+      case MAIN_MENU:
+        // Maintenant 4 options
+        currentMenuIndex = (currentMenuIndex + 1) % 4;
+        displayMenu();
+        break;
+      
+      case CHANGE_TIME_HOURS:
+        adjustedHours = (adjustedHours + 1) % 24;
+        drawTimeAdjustmentScreen(true);
+        break;
+      
+      case CHANGE_TIME_MINUTES:
+        adjustedMinutes = (adjustedMinutes + 1) % 60;
+        drawTimeAdjustmentScreen(false);
+        break;
+
+      case ALARM_HOURS:
+        alarmHours[currentAlarmIndex] = (alarmHours[currentAlarmIndex] + 1) % 24;
+        drawAlarmAdjustmentScreen(true);
+        break;
+
+      case ALARM_MINUTES:
+        alarmMinutes[currentAlarmIndex] = (alarmMinutes[currentAlarmIndex] + 1) % 60;
+        drawAlarmAdjustmentScreen(false);
+        break;
+
+      case ALARM_SELECTION:
+        currentAlarmIndex = (currentAlarmIndex + 1) % 2;
+        displayAlarmSelection();
+        break;
+
+      default:
+        break;
+    }
+  }
+
+  if (digitalRead(BTN_SELECT) == LOW) {
+    lastButtonPress = millis();
+    
+    switch(currentState) {
+      case MAIN_MENU:
+        if (currentMenuIndex == 0) {
+          currentState = ALARM_HOURS;
+          drawAlarmAdjustmentScreen(true);
+        } else if (currentMenuIndex == 1) {
+          DateTime now = rtc.now();
+          adjustedHours = now.hour();
+          adjustedMinutes = now.minute();
+          currentState = CHANGE_TIME_HOURS;
+          drawTimeAdjustmentScreen(true);
+        } else if (currentMenuIndex == 2) {
+          is24HourFormat = !is24HourFormat;
+          drawFormatChangedScreen();
+          delay(1000);
+          currentState = MAIN_MENU;
+          displayMenu();
+        } else if (currentMenuIndex == 3) {
+          currentState = ALARM_SELECTION;
+          displayAlarmSelection();
+        }
+        break;
+     
+      case ALARM_HOURS:
+        currentState = ALARM_MINUTES;
+        drawAlarmAdjustmentScreen(false);
+        break;
+
+      case ALARM_MINUTES:
+        alarmSet = true;
+        currentState = MAIN_MENU;
+        displayMenu();
+        break;
+
+      case CHANGE_TIME_HOURS:
+        currentState = CHANGE_TIME_MINUTES;
+        drawTimeAdjustmentScreen(false);
+        break;
+      
+      case CHANGE_TIME_MINUTES:
+        {
+          DateTime now = rtc.now();
+          DateTime newTime = DateTime(now.year(), now.month(), now.day(), adjustedHours, adjustedMinutes, 0);
+          rtc.adjust(newTime);
+        }
+        currentState = MAIN_MENU;
+        displayMenu();
+        break;
+      
+      case SUCCESS_SCREEN:
+        currentState = MAIN_MENU;
+        displayMenu();
+        break;
+
+      case ALARM_SELECTION:
+        // Alarme choisie, retour menu principal
+        currentState = MAIN_MENU;
+        displayMenu();
+        break;
+
+      default:
+        break;
+    }
+  }
+}
+
+void setup() {
+  Serial.begin(9600);
+
+  for (int i = 0; i < NUM_MATRICES; i++) {
+    lc.shutdown(i, false);     
+    lc.setIntensity(i, 10);     
+    lc.clearDisplay(i);         
+  }
+  
+  if (!rtc.begin()) {
+    while (1);
+  }
+
+  if (!rtc.isrunning()) {
+    rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));
+  }
+
+  int rc = oledInit(&ssoled, MY_OLED, OLED_ADDR, FLIP180, INVERT, USE_HW_I2C, SDA_PIN, SCL_PIN, RESET_PIN, 400000L);
+
+  pinMode(BTN_NAVIGATE, INPUT_PULLUP);
+  pinMode(BTN_SELECT, INPUT_PULLUP);
+  pinMode(BTN_STOP_ALARM, INPUT_PULLUP);
+  pinMode(BUZZER_PIN, OUTPUT);
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
+
+  currentState = MAIN_MENU;
+  
+  afficheHeures();
+  displayMenu();
+}
+
+void loop() {
+  afficheHeures();
+  
+  if (millis() / 500 % 2 == 0) {
+    afficheSeparateur();
+  } else {
+    lc.setLed(2, 2, 7, false);
+    lc.setLed(2, 5, 7, false);
+  }
+
+  handleNavigation();
+  checkAlarm();
+  updateAlarm();
+  checkUltrasonicForSnooze();
+
+  switch(currentState) {
+    case CHANGE_TIME_HOURS:
+      drawTimeAdjustmentScreen(true);
+      break;
+    case CHANGE_TIME_MINUTES:
+      drawTimeAdjustmentScreen(false);
+      break;
+    default:
+      break;
+  }
+
+  delay(50);
+}
